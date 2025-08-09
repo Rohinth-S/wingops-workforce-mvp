@@ -8,20 +8,16 @@ beforeEach(() => {
 });
 describe("WingOps task workflow", () => {
   it("requires submission note and records events", async () => {
-    const s = await request(app)
-      .post("/auth/register")
-      .send({
-        email: "s@test.local",
-        password: "correct-horse-battery",
-        role: "supervisor",
-      });
-    const a = await request(app)
-      .post("/auth/register")
-      .send({
-        email: "a@test.local",
-        password: "correct-horse-battery",
-        role: "agent",
-      });
+    const s = await request(app).post("/auth/register").send({
+      email: "s@test.local",
+      password: "correct-horse-battery",
+      role: "supervisor",
+    });
+    const a = await request(app).post("/auth/register").send({
+      email: "a@test.local",
+      password: "correct-horse-battery",
+      role: "agent",
+    });
     const l = await request(app)
       .post("/auth/login")
       .send({ email: "s@test.local", password: "correct-horse-battery" });
