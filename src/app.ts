@@ -69,6 +69,12 @@ function allow(...roles: Role[]) {
     next();
   };
 }
+function intQuery(value: unknown, fallback: number, max = 100) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed)
+    ? Math.min(max, Math.max(1, Math.floor(parsed)))
+    : fallback;
+}
 
 app.get("/health", (_, res) =>
   res.json({
@@ -145,18 +151,29 @@ app.post("/tasks", auth, allow("admin", "supervisor"), async (req: A, res) => {
   await event(req.user!.sub, id, "task.created", p.data);
   res.status(201).json({ id, ...p.data, status });
 });
-app.get("/tasks", auth, async (req: A, res) =>
-  res.json(
-    await (await getRepository()).listTasks(req.user!.role, req.user!.sub),
-  ),
-);
+app.get("/tasks", auth, async (req: A, res) => {
+  const hasPage = req.query.page !== undefined || req.query.pageSize !== undefined ||
+    req.query.search !== undefined || req.query.status !== undefined || req.query.assigneeId !== undefined;
+  const repo = await getRepository();
+  if (!hasPage) return res.json(await repo.listTasks(req.user!.role, req.user!.sub));
+  const page = await repo.listTaskPage(req.user!.role, req.user!.sub, {
+    page: intQuery(req.query.page, 1, 10_000),
+    pageSize: intQuery(req.query.pageSize, 25),
+    search: typeof req.query.search === "string" ? req.query.search : undefined,
+    status: typeof req.query.status === "string" ? req.query.status : undefined,
+    assigneeId: typeof req.query.assigneeId === "string" ? req.query.assigneeId : undefined,
+  });
+  res.json(page);
+});
 app.post("/tasks/:id/accept", auth, allow("agent"), async (req: A, res) => {
   const repo = await getRepository();
   const t = await repo.getTask(String(req.params.id));
   if (!t) return res.status(404).json({ error: "task not found" });
   if (t.status !== "open")
     return res.status(409).json({ error: "task is not open" });
-  await repo.acceptTask(t.id, req.user!.sub);
+  const claimed = await repo.acceptTask(t.id, req.user!.sub);
+  if (!claimed)
+    return res.status(409).json({ error: "task was claimed by another agent" });
   await event(req.user!.sub, t.id, "task.accepted");
   res.json({ id: t.id, status: "accepted", assigneeId: req.user!.sub });
 });
@@ -200,6 +217,8 @@ app.post("/tasks/:id/attachments", auth, async (req: A, res) => {
     .object({
       name: z.string().regex(/^[\w.-]+$/),
       mime: z.enum(["image/jpeg", "image/png", "application/pdf"]),
+      sha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
+      sizeBytes: z.number().int().positive().max(25 * 1024 * 1024),
     })
     .safeParse(req.body);
   if (!p.success) return res.status(400).json({ error: p.error.flatten() });
@@ -211,6 +230,8 @@ app.post("/tasks/:id/attachments", auth, async (req: A, res) => {
     name: p.data.name,
     mime: p.data.mime,
     objectKey: key,
+    sha256: p.data.sha256.toLowerCase(),
+    sizeBytes: p.data.sizeBytes,
   });
   try {
     const signed = await createSignedUpload(key, 600);
@@ -229,9 +250,59 @@ app.post("/tasks/:id/attachments", auth, async (req: A, res) => {
     res.status(502).json({ error: "storage provider unavailable" });
   }
 });
-app.get("/tasks/:id/events", auth, async (req, res) =>
-  res.json(await (await getRepository()).listEvents(String(req.params.id))),
+app.get("/tasks/:id/events", auth, async (req: A, res) => {
+  const hasPaging = req.query.limit !== undefined || req.query.before !== undefined || req.query.type !== undefined;
+  const repo = await getRepository();
+  const requestedLimit = intQuery(req.query.limit, 50);
+  const items = await repo.listEvents(String(req.params.id), {
+    limit: hasPaging ? requestedLimit : undefined,
+    before: typeof req.query.before === "string" ? req.query.before : undefined,
+    type: typeof req.query.type === "string" ? req.query.type : undefined,
+  });
+  if (!hasPaging) return res.json(items);
+  res.json({ items, nextCursor: items.length === requestedLimit ? items[items.length - 1]?.created_at ?? null : null });
+});
+app.post("/tasks/:id/attachments/:attachmentId/verify", auth, async (req: A, res) => {
+  const repo = await getRepository();
+  const task = await repo.getTask(String(req.params.id));
+  if (!task) return res.status(404).json({ error: "task not found" });
+  if (req.user!.role === "agent" && task.assignee_id !== req.user!.sub)
+    return res.status(403).json({ error: "not your task" });
+  const p = z
+    .object({
+      sha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
+      sizeBytes: z.number().int().positive().max(25 * 1024 * 1024),
+    })
+    .safeParse(req.body);
+  if (!p.success) return res.status(400).json({ error: p.error.flatten() });
+  const verified = await repo.verifyAttachment(
+    String(req.params.attachmentId),
+    task.id,
+    p.data.sha256,
+    p.data.sizeBytes,
+  );
+  if (!verified) return res.status(422).json({ error: "attachment integrity check failed" });
+  await event(req.user!.sub, task.id, "attachment.verified", {
+    attachmentId: String(req.params.attachmentId),
+    sha256: p.data.sha256.toLowerCase(),
+    sizeBytes: p.data.sizeBytes,
+  });
+  res.json({ verified: true, attachmentId: String(req.params.attachmentId) });
+});
+app.get("/metrics", auth, allow("admin", "supervisor"), async (req: A, res) =>
+  res.json(await (await getRepository()).metrics(req.user!.role, req.user!.sub)),
 );
+app.get("/outbox", auth, allow("admin", "supervisor"), async (req, res) =>
+  res.json(await (await getRepository()).listOutbox({
+    pendingOnly: req.query.pendingOnly !== "false",
+    limit: req.query.limit === undefined ? undefined : intQuery(req.query.limit, 50),
+  })),
+);
+app.post("/outbox/:id/publish", auth, allow("admin", "supervisor"), async (req, res) => {
+  const published = await (await getRepository()).markOutboxPublished(String(req.params.id));
+  if (!published) return res.status(404).json({ error: "outbox event not found or already published" });
+  res.status(204).send();
+});
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   console.error(err);
   res.status(500).json({ error: "internal error" });
