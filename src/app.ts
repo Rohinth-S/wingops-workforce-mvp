@@ -49,7 +49,7 @@ async function event(
   type: string,
   metadata: unknown = {},
 ) {
-  (await getRepository()).addEvent({ actorId, taskId, type, metadata });
+  await (await getRepository()).addEvent({ actorId, taskId, type, metadata });
 }
 function auth(req: A, res: Response, next: NextFunction) {
   const h = req.header("authorization");
