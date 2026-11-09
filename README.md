@@ -62,3 +62,7 @@ Set `DB_URL` or `SUPABASE_DB_URL` with `POSTGRES_ROUTES_ENABLED=true` to select 
 Apply sql/postgres-schema.sql to the provisioned Supabase database. It creates the wingops_users, wingops_tasks, wingops_attachments, and wingops_events tables with UUID keys, JSONB event metadata, and RLS enabled. DB_URL or SUPABASE_DB_URL selects the async repository; local tests continue to use SQLite. SUPABASE_SERVICE_ROLE_KEY is server-only.
 
 Startup does not run DDL against the managed database; apply the checked-in SQL migration before enabling Postgres routes.
+
+## Operations runbooks
+
+WingOps's production contracts are maintained as focused runbooks in [`docs/operations`](docs/operations/). The set covers task-state transitions, assignment races, attachment uploads, event history, Postgres/RLS, rollout, and incident response.
