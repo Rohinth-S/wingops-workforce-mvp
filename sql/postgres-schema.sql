@@ -8,3 +8,7 @@ ALTER TABLE wingops_users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE wingops_tasks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE wingops_attachments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE wingops_events ENABLE ROW LEVEL SECURITY;
+CREATE POLICY service_role_full_access ON wingops_users FOR ALL TO service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_role_full_access ON wingops_tasks FOR ALL TO service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_role_full_access ON wingops_attachments FOR ALL TO service_role USING (true) WITH CHECK (true);
+CREATE POLICY service_role_full_access ON wingops_events FOR ALL TO service_role USING (true) WITH CHECK (true);
