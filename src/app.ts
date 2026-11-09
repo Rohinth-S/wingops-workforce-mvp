@@ -2,7 +2,6 @@ import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import crypto from "node:crypto";
 import { z } from "zod";
-import { db } from "./db.js";
 import { createSignedUpload } from "./storage.js";
 import {
   hashPassword,
@@ -12,6 +11,8 @@ import {
   Claims,
   Role,
 } from "./security.js";
+import { createLocalRepository, WingOpsRepository } from "./repository.js";
+
 const app = express();
 const corsOrigins = (process.env.CORS_ORIGINS ?? "")
   .split(",")
@@ -31,7 +32,25 @@ app.use(
   }),
 );
 app.use(express.json({ limit: "2mb" }));
+
 type A = Request & { user?: Claims };
+let repositoryPromise: Promise<WingOpsRepository> = Promise.resolve(
+  createLocalRepository(),
+);
+export function setRepository(repository: WingOpsRepository) {
+  repositoryPromise = Promise.resolve(repository);
+}
+export async function getRepository() {
+  return repositoryPromise;
+}
+async function event(
+  actorId: string,
+  taskId: string,
+  type: string,
+  metadata: unknown = {},
+) {
+  (await getRepository()).addEvent({ actorId, taskId, type, metadata });
+}
 function auth(req: A, res: Response, next: NextFunction) {
   const h = req.header("authorization");
   if (!h?.startsWith("Bearer "))
@@ -43,59 +62,53 @@ function auth(req: A, res: Response, next: NextFunction) {
     return res.status(401).json({ error: "invalid token" });
   }
 }
-function allow(...r: Role[]) {
+function allow(...roles: Role[]) {
   return (req: A, res: Response, next: NextFunction) => {
-    if (!req.user || !r.includes(req.user.role))
+    if (!req.user || !roles.includes(req.user.role))
       return res.status(403).json({ error: "forbidden" });
     next();
   };
 }
-function event(
-  actor: string,
-  task: string,
-  type: string,
-  payload: unknown = {},
-) {
-  db.prepare("INSERT INTO events VALUES (?,?,?,?,?,?)").run(
-    crypto.randomUUID(),
-    task,
-    actor,
-    type,
-    JSON.stringify(payload),
-    new Date().toISOString(),
-  );
-}
-app.get("/health", (_, res) => res.json({ service: "wingops", status: "ok" }));
+
+app.get("/health", (_, res) =>
+  res.json({
+    service: "wingops",
+    status: "ok",
+    persistence:
+      process.env.DB_URL || process.env.SUPABASE_DB_URL ? "postgres" : "sqlite",
+  }),
+);
 const reg = z.object({
   email: z.string().email(),
   password: z.string().min(12),
   role: z.enum(["admin", "supervisor", "agent"]).default("agent"),
 });
-app.post("/auth/register", (req, res) => {
+app.post("/auth/register", async (req, res) => {
   const p = reg.safeParse(req.body);
   if (!p.success) return res.status(400).json({ error: p.error.flatten() });
   const id = crypto.randomUUID();
   try {
-    db.prepare("INSERT INTO users VALUES (?,?,?,?,?)").run(
+    await (
+      await getRepository()
+    ).createUser({
       id,
-      p.data.email.toLowerCase(),
-      p.data.role,
-      hashPassword(p.data.password),
-      new Date().toISOString(),
-    );
+      email: p.data.email.toLowerCase(),
+      role: p.data.role,
+      passwordHash: hashPassword(p.data.password),
+    });
     res.status(201).json({ id, email: p.data.email, role: p.data.role });
   } catch {
     res.status(409).json({ error: "email exists" });
   }
 });
-app.post("/auth/login", (req, res) => {
+app.post("/auth/login", async (req, res) => {
   const p = z
     .object({ email: z.string().email(), password: z.string() })
     .safeParse(req.body);
   if (!p.success) return res.status(400).json({ error: "invalid credentials" });
-  const u = db
-    .prepare("SELECT * FROM users WHERE email=?")
-    .get(p.data.email.toLowerCase()) as any;
+  const u = await (
+    await getRepository()
+  ).getUserByEmail(p.data.email.toLowerCase());
   if (!u || !verifyPassword(p.data.password, u.password_hash))
     return res.status(401).json({ error: "invalid credentials" });
   res.json({
@@ -109,67 +122,53 @@ const task = z.object({
   dueAt: z.string().datetime(),
   assigneeId: z.string().optional(),
 });
-app.post("/tasks", auth, allow("admin", "supervisor"), (req: A, res) => {
+app.post("/tasks", auth, allow("admin", "supervisor"), async (req: A, res) => {
   const p = task.safeParse(req.body);
   if (!p.success) return res.status(400).json({ error: p.error.flatten() });
+  const repo = await getRepository();
   if (p.data.assigneeId) {
-    const a = db
-      .prepare("SELECT id,role FROM users WHERE id=?")
-      .get(p.data.assigneeId) as any;
+    const a = await repo.getAgent(p.data.assigneeId);
     if (!a || a.role !== "agent")
       return res.status(422).json({ error: "assignee must be an agent" });
   }
   const id = crypto.randomUUID();
-  db.prepare("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?)").run(
+  const status = p.data.assigneeId ? "accepted" : "open";
+  await repo.createTask({
     id,
-    p.data.title,
-    p.data.description,
-    p.data.assigneeId ? "accepted" : "open",
-    req.user!.sub,
-    p.data.assigneeId ?? null,
-    p.data.dueAt,
-    new Date().toISOString(),
-  );
-  event(req.user!.sub, id, "task.created", p.data);
-  res
-    .status(201)
-    .json({ id, ...p.data, status: p.data.assigneeId ? "accepted" : "open" });
+    title: p.data.title,
+    description: p.data.description,
+    status,
+    ownerId: req.user!.sub,
+    assigneeId: p.data.assigneeId ?? null,
+    dueAt: p.data.dueAt,
+  });
+  await event(req.user!.sub, id, "task.created", p.data);
+  res.status(201).json({ id, ...p.data, status });
 });
-app.get("/tasks", auth, (req: A, res) => {
-  const rows =
-    req.user!.role === "agent"
-      ? db
-          .prepare(
-            "SELECT * FROM tasks WHERE assignee_id=? OR (assignee_id IS NULL AND status='open') ORDER BY due_at",
-          )
-          .all(req.user!.sub)
-      : db.prepare("SELECT * FROM tasks ORDER BY due_at").all();
-  res.json(rows);
-});
-app.post("/tasks/:id/accept", auth, allow("agent"), (req: A, res) => {
-  const t = db
-    .prepare("SELECT * FROM tasks WHERE id=?")
-    .get(req.params.id) as any;
+app.get("/tasks", auth, async (req: A, res) =>
+  res.json(
+    await (await getRepository()).listTasks(req.user!.role, req.user!.sub),
+  ),
+);
+app.post("/tasks/:id/accept", auth, allow("agent"), async (req: A, res) => {
+  const repo = await getRepository();
+  const t = await repo.getTask(String(req.params.id));
   if (!t) return res.status(404).json({ error: "task not found" });
   if (t.status !== "open")
     return res.status(409).json({ error: "task is not open" });
-  db.prepare("UPDATE tasks SET assignee_id=?,status='accepted' WHERE id=?").run(
-    req.user!.sub,
-    t.id,
-  );
-  event(req.user!.sub, t.id, "task.accepted");
+  await repo.acceptTask(t.id, req.user!.sub);
+  await event(req.user!.sub, t.id, "task.accepted");
   res.json({ id: t.id, status: "accepted", assigneeId: req.user!.sub });
 });
 const next = z.object({
   status: z.enum(["in_progress", "submitted", "approved", "rejected"]),
   note: z.string().max(1000).optional(),
 });
-app.post("/tasks/:id/status", auth, (req: A, res) => {
+app.post("/tasks/:id/status", auth, async (req: A, res) => {
   const p = next.safeParse(req.body);
   if (!p.success) return res.status(400).json({ error: p.error.flatten() });
-  const t = db
-    .prepare("SELECT * FROM tasks WHERE id=?")
-    .get(req.params.id) as any;
+  const repo = await getRepository();
+  const t = await repo.getTask(String(req.params.id));
   if (!t) return res.status(404).json({ error: "task not found" });
   if (req.user!.role === "agent" && t.assignee_id !== req.user!.sub)
     return res.status(403).json({ error: "not your task" });
@@ -182,17 +181,18 @@ app.post("/tasks/:id/status", auth, (req: A, res) => {
   if (!allowed[t.status]?.includes(p.data.status))
     return res
       .status(409)
-      .json({ error: `invalid transition ${t.status} -> ${p.data.status}` });
+      .json({
+        error: "invalid transition " + t.status + " -> " + p.data.status,
+      });
   if (p.data.status === "submitted" && !p.data.note)
     return res.status(422).json({ error: "submission note required" });
-  db.prepare("UPDATE tasks SET status=? WHERE id=?").run(p.data.status, t.id);
-  event(req.user!.sub, t.id, "task.status_changed", p.data);
+  await repo.updateTaskStatus(t.id, p.data.status);
+  await event(req.user!.sub, t.id, "task.status_changed", p.data);
   res.json({ id: t.id, status: p.data.status });
 });
 app.post("/tasks/:id/attachments", auth, async (req: A, res) => {
-  const t = db
-    .prepare("SELECT * FROM tasks WHERE id=?")
-    .get(req.params.id) as any;
+  const repo = await getRepository();
+  const t = await repo.getTask(String(req.params.id));
   if (!t) return res.status(404).json({ error: "task not found" });
   if (req.user!.role === "agent" && t.assignee_id !== req.user!.sub)
     return res.status(403).json({ error: "not your task" });
@@ -204,34 +204,36 @@ app.post("/tasks/:id/attachments", auth, async (req: A, res) => {
     .safeParse(req.body);
   if (!p.success) return res.status(400).json({ error: p.error.flatten() });
   const id = crypto.randomUUID(),
-    key = `wingops/${t.id}/${id}-${p.data.name}`;
-  db.prepare("INSERT INTO attachments VALUES (?,?,?,?,?,NULL)").run(
+    key = "wingops/" + t.id + "/" + id + "-" + p.data.name;
+  await repo.addAttachment({
     id,
-    t.id,
-    p.data.name,
-    p.data.mime,
-    key,
-  );
+    taskId: t.id,
+    name: p.data.name,
+    mime: p.data.mime,
+    objectKey: key,
+  });
   try {
     const signed = await createSignedUpload(key, 600);
-    res.status(201).json({
-      id,
-      objectKey: key,
-      uploadUrl: signed.uploadUrl,
-      uploadToken: signed.token,
-      expiresIn: signed.expiresIn,
-      provider: signed.provider,
-    });
+    res
+      .status(201)
+      .json({
+        id,
+        objectKey: key,
+        uploadUrl: signed.uploadUrl,
+        uploadToken: signed.token,
+        expiresIn: signed.expiresIn,
+        provider: signed.provider,
+      });
   } catch (error) {
     console.error(error);
     res.status(502).json({ error: "storage provider unavailable" });
   }
 });
-app.get("/tasks/:id/events", auth, (req, res) =>
-  res.json(
-    db
-      .prepare("SELECT * FROM events WHERE task_id=? ORDER BY created_at")
-      .all(req.params.id),
-  ),
+app.get("/tasks/:id/events", auth, async (req, res) =>
+  res.json(await (await getRepository()).listEvents(String(req.params.id))),
 );
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  console.error(err);
+  res.status(500).json({ error: "internal error" });
+});
 export default app;
