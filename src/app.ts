@@ -3,6 +3,7 @@ import cors from "cors";
 import crypto from "node:crypto";
 import { z } from "zod";
 import { db } from "./db.js";
+import { createSignedUpload } from "./storage.js";
 import {
   hashPassword,
   verifyPassword,
@@ -188,7 +189,7 @@ app.post("/tasks/:id/status", auth, (req: A, res) => {
   event(req.user!.sub, t.id, "task.status_changed", p.data);
   res.json({ id: t.id, status: p.data.status });
 });
-app.post("/tasks/:id/attachments", auth, (req: A, res) => {
+app.post("/tasks/:id/attachments", auth, async (req: A, res) => {
   const t = db
     .prepare("SELECT * FROM tasks WHERE id=?")
     .get(req.params.id) as any;
@@ -211,14 +212,20 @@ app.post("/tasks/:id/attachments", auth, (req: A, res) => {
     p.data.mime,
     key,
   );
-  res
-    .status(201)
-    .json({
+  try {
+    const signed = await createSignedUpload(key, 600);
+    res.status(201).json({
       id,
       objectKey: key,
-      uploadUrl: `https://s3.local/${key}`,
-      expiresIn: 600,
+      uploadUrl: signed.uploadUrl,
+      uploadToken: signed.token,
+      expiresIn: signed.expiresIn,
+      provider: signed.provider,
     });
+  } catch (error) {
+    console.error(error);
+    res.status(502).json({ error: "storage provider unavailable" });
+  }
 });
 app.get("/tasks/:id/events", auth, (req, res) =>
   res.json(
