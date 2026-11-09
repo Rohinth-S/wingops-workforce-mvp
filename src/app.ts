@@ -12,6 +12,7 @@ import {
   Role,
 } from "./security.js";
 import { createLocalRepository, WingOpsRepository } from "./repository.js";
+import { buildEscalationQueue } from "./sla.js";
 
 const app = express();
 const corsOrigins = (process.env.CORS_ORIGINS ?? "")
@@ -165,6 +166,12 @@ app.get("/tasks", auth, async (req: A, res) => {
   });
   res.json(page);
 });
+app.get("/sla/escalations", auth, allow("admin", "supervisor"), async (req: A, res) => {
+  const parsed = z.coerce.number().int().min(1).max(24 * 7).optional().safeParse(req.query.atRiskMinutes);
+  if (!parsed.success) return res.status(400).json({ error: "atRiskMinutes must be an integer from 1 to 168" });
+  const tasks = await (await getRepository()).listTasks(req.user!.role, req.user!.sub);
+  res.json(buildEscalationQueue(tasks, new Date(), parsed.data ?? 60));
+});
 app.post("/tasks/:id/accept", auth, allow("agent"), async (req: A, res) => {
   const repo = await getRepository();
   const t = await repo.getTask(String(req.params.id));
@@ -180,6 +187,46 @@ app.post("/tasks/:id/accept", auth, allow("agent"), async (req: A, res) => {
 const next = z.object({
   status: z.enum(["in_progress", "submitted", "approved", "rejected"]),
   note: z.string().max(1000).optional(),
+});
+const bulkStatus = z.object({
+  taskIds: z.array(z.string().uuid()).min(1).max(100),
+  status: z.enum(["in_progress", "submitted", "approved", "rejected"]),
+  note: z.string().max(1000).optional(),
+  dryRun: z.boolean().default(true),
+});
+app.post("/tasks/bulk-status", auth, allow("admin", "supervisor"), async (req: A, res) => {
+  const parsed = bulkStatus.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const repo = await getRepository();
+  const allowed: Record<string, string[]> = {
+    accepted: ["in_progress"],
+    in_progress: ["submitted"],
+    submitted: ["approved", "rejected"],
+    rejected: ["in_progress"],
+  };
+  const applied: Array<{ taskId: string; status: string }> = [];
+  const skipped: Array<{ taskId: string; reason: string }> = [];
+  for (const taskId of [...new Set(parsed.data.taskIds)]) {
+    const task = await repo.getTask(taskId);
+    if (!task) {
+      skipped.push({ taskId, reason: "task_not_found" });
+      continue;
+    }
+    if (!allowed[task.status]?.includes(parsed.data.status)) {
+      skipped.push({ taskId, reason: `invalid_transition:${task.status}->${parsed.data.status}` });
+      continue;
+    }
+    if (parsed.data.status === "submitted" && !parsed.data.note) {
+      skipped.push({ taskId, reason: "submission_note_required" });
+      continue;
+    }
+    if (!parsed.data.dryRun) {
+      await repo.updateTaskStatus(task.id, parsed.data.status);
+      await event(req.user!.sub, task.id, "task.bulk_status_changed", { status: parsed.data.status, note: parsed.data.note });
+    }
+    applied.push({ taskId, status: parsed.data.status });
+  }
+  res.json({ dryRun: parsed.data.dryRun, applied, skipped, appliedCount: parsed.data.dryRun ? 0 : applied.length });
 });
 app.post("/tasks/:id/status", auth, async (req: A, res) => {
   const p = next.safeParse(req.body);
